@@ -180,6 +180,17 @@ def delete_recipe_history(db, history_id: int, commit: bool = True):
 def get_all_recipe_history(db: Session):
     return db.query(RecipeHistory).order_by(RecipeHistory.created_at.desc()).all()
 
+def clear_shopping_list(db: Session, commit: bool = True):
+    """買い物リストの項目を全て削除する"""
+    try:
+        # ShoppingItem モデルのすべてのレコードを削除
+        db.query(ShoppingItem).delete()
+        if commit:
+            db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        raise e
 
 # =======================================
 # 7. テーブル作成

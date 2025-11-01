@@ -10,6 +10,76 @@ from sqlalchemy.orm import Session
 import random
 import time
 import datetime 
+import io # 画像処理用にioをインポート
+from PIL import Image # 画像処理用にPILをインポート
+import base64 # GPT-4o Vision用にbase64をインポート
+
+
+
+# ----------------------------------------------------
+# 🚨 新規追加：レシート画像処理ロジック 🚨
+# ----------------------------------------------------
+
+def process_receipt(uploaded_file):
+    """
+    レシート画像をGPT-4o Vision APIに送信し、食材リストをJSONで抽出する。
+    """
+    try:
+        # 1. OpenAI クライアントの初期化 (st.secrets["openai"]["api_key"] を使用)
+        client = OpenAI(api_key=st.secrets["openai"]["api_key"]) 
+
+        # 2. アップロードされたファイルをバイナリに変換し、Base64エンコード
+        image_bytes = uploaded_file.getvalue()
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        # 3. システムプロンプト (抽出ルール)
+        # (システムプロンプトは変更なしでOK)
+        system_content = """
+        あなたは優秀なデータ抽出AIです。提供されたレシート画像から、購入された品目名のみを正確に抽出してください。
+        
+        【重要ルール】
+        1. **抽出対象:** 食材、調味料、日用品など、購入された品目名のみを抽出する。
+        2. **除外対象:** 合計金額、小計、消費税、店名、日付、時間、ポイントなど、品目名以外の情報は絶対に出力しないでください。
+        3. **数量:** レシートから正確に数量を読み取ることは困難であるため、抽出した品目ごとに数量は常に「1」としてください。
+        4. **出力形式:** 抽出結果は、他の情報や説明を一切加えず、以下の**JSON形式（Python辞書形式）**でのみ出力してください。
+        
+        【出力形式】
+        {
+          "items": [
+            {"name": "豚こま", "quantity": "1"},
+            {"name": "牛乳", "quantity": "1"},
+            {"name": "キャベツ", "quantity": "1"}
+          ]
+        }
+        """
+        
+        # 4. API呼び出し (GPT-4o Visionを使用)
+        response = client.chat.completions.create(
+            model="gpt-4o", # 👈 モデル名をgpt-4oに固定
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "レシート画像の内容を上記のルールに従ってJSONで抽出してください。"},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}"
+                    }}
+                ]}
+            ],
+            temperature=0.0
+        )
+        
+        # 5. 結果のパース
+        import json
+        # GPTが出力したJSON文字列から不要なマークダウンを削除
+        json_str = response.choices[0].message.content.strip().lstrip('```json').rstrip('```').strip()
+        extracted_data = json.loads(json_str)
+        
+        return extracted_data.get("items", [])
+        
+    except Exception as e:
+        st.error(f"🚨 レシート処理中にエラーが発生しました。\n詳細: {e}")
+        return None
+
 
 # フォームリセット用のキー初期化
 if "registration_key" not in st.session_state:
@@ -61,40 +131,34 @@ def suggest_menu(ingredients_list, allergy_list, time_constraint = ""):
     # 【プロンプト改善１】システムプロンプトに制約を集約
     # --------------------------------------------------------------------------
     system_content_for_openai = f"""
-    あなたは創造性に溢れ、特に子供を持つ家庭の食事の安全性に配慮する料理専門家です。簡潔で実用的なレシピ提案を作成してください。
+    あなたは優秀な料理専門家であり、レシピ提案AIです。簡潔で実用的なレシピ提案を作成してください。
     
     ################################################################
-    ## 🚨 最優先指令：安全性・創造性・柔軟性 🚨
+    ## 🚨 最重要指令：制約の厳守 🚨
     ################################################################
     
-    1. **【最優先：アレルギー・使用不可食材】** {allergy_instruction.strip()} **アレルギー食材、使用不可食材、またはその派生品を**絶対に使用禁止**。このルールは他のすべてに優先します。**
-    2. **🔥 提案の核：** 提案は**クリエイティブで多様な調理法**を積極的に採用し、**一般的なレシピのパターンから脱却する**ことを優先してください。
-    3. **【食材の選択と優先順位】** 期限間近の食材を優先的に使用してください。**冷蔵庫にある全食材を一気に使い切る必要はありません。** レシピに合う食材のみを選んでください。
-    4. **【調理時間】** {time_constraint} 調理時間には必ず内訳（下準備X分、加熱Y分）を明記し、時間制約がある場合は短縮調理法を採用してください。
-    5. **【レシピの完全性強制】** 提案するレシピは、**調理に必要なすべての食材と調味料**を含んだ、**調理可能な完全なレシピ**であること。
+    1. 【食材使用】ユーザー提供のリストにある食材は、提案レシピに**すべて**使用しなければなりません。
+    2. 【アレルギー】{allergy_instruction.strip()} いかなる理由があってもアレルギー食材を**絶対に使用してはいけません**。
+    3. 【調理時間】{time_constraint}
+        - **時間計算の厳守:** レシピ冒頭の「調理時間：XX分」は、**予熱、下準備、加熱、盛り付けの全工程の合計時間**を指します。
+        - **内訳の証明強制:** 「調理時間」の欄には、必ず**「調理時間：Z分（内訳：下準備X分、加熱Y分）」**のように内訳を追記し、合計時間が妥当であることを数学的に証明してください。
+        - **短縮調理法の強制:** 時間制約（特に30分未満）がある場合、**オーブン調理（予熱時間込み）、長時間煮込む煮物、揚げ物など、時間超過が確実な調理法は絶対に使用を禁止します**。短時間で完了する代替調理法（炒め物、レンジ調理など）を必ず採用してください。
+    4. 【買い物リスト】提案レシピの全食材・調味料のうち、ユーザーのリストに**存在しないものはすべて**、漏れなく【不足食材・買い物リスト】セクションに箇条書きでリストアップしなければなりません。
     
     ################################################################
     ## 提案の形式
     ################################################################
     
-    以下の手順と形式を**厳守**してください。このセクションには指令（例: 【○○強制】）を含めず、結果のみを出力すること。
+    以下の手順と形式を厳守してください。装飾的なMarkdown（例：#、##、***、太字）はレシピ名以外では極力避け、簡潔に出力してください。
     
     1. **提案名**：レシピ名を太字で魅力的に書く。
-    2. **調理法**：レシピの調理法を明記する。
-    3. **調理時間**：合計時間と内訳を明記する（例：調理時間：35分（内訳：下準備10分、加熱25分））。
-    4. **使用食材**：提案で使用した食材のみをリストから抽出する。（箇条書き、数量も併記）
-    5. **使用調味料**：レシピの味付けに必要な調味料をすべて箇条書きでリストアップする。
-    6. **不足食材・買い物リスト**：
-        **以下の厳密な手順に従って出力すること:**
-        a. 提案レシピで使用する**「4. 使用食材」**と**「5. 使用調味料」**のすべてを統合したリストを作成する。
-        b. その統合リストを、ユーザーから提供された**「現在の食材リスト」**と**厳密に照合**する。
-        c. **照合の結果、リストに存在しないもの、または量が不足しているものだけ**を、漏れなく箇条書きでリストアップしてください。
-    7. **提案理由**：期限が近い食材に言及し、提案した理由を簡潔に述べる。
-    8. **調理手順**：具体的な手順を箇条書きで分かりやすく示す。
+    2. **調理法**：レシピの調理法（例：煮物、揚げ物）を明記する。
+    3. **調理時間**：合計時間と内訳（例：調理時間：35分（内訳：下準備10分、加熱25分））を明記する。
+    4. **使用食材**：リストから使用する食材をすべて抽出する。（箇条書き）
+    5. **不足食材・買い物リスト**：提案レシピに必要な、冷蔵庫リストにない調味料や副材料を箇条書きでリストアップする。
+    6. **提案理由**：期限が近い食材に言及し、提案した理由を簡潔に述べる。
+    7. **調理手順**：具体的な手順を箇条書きで分かりやすく示す。
     """
-    
-    
-    
     
     # --------------------------------------------------------------------------
     # ユーザープロンプトは簡潔に
@@ -111,12 +175,12 @@ def suggest_menu(ingredients_list, allergy_list, time_constraint = ""):
         client = OpenAI(api_key=st.secrets["openai"]["api_key"]) 
         
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_content_for_openai}, 
                 {"role": "user", "content": prompt}
             ],
-            temperature=1.0
+            temperature=0.7
         )
         
         return response.choices[0].message.content
@@ -249,6 +313,123 @@ def main():
                 
         else:
             display_auto_clear_message("食材名と数量は必須項目です。", "warning")
+            
+    # ----------------------------------------------------
+    # 4-2. 🆕 レシート画像からの食材登録エリア 📸
+    # ----------------------------------------------------
+    st.header("📸 レシートから食材を一括登録")
+    st.markdown("スーパーなどの**レシート画像**をアップロードすると、AIが自動で品目を抽出して食材リストに登録します。")
+
+    uploaded_receipt = st.file_uploader(
+        "レシート画像を選択してください",
+        type=["png", "jpg", "jpeg"],
+        key="receipt_uploader"
+    )
+
+    # 💡 修正点1: 抽出状態を保持するためのセッションステートキーを初期化
+    if "extracted_receipt_data" not in st.session_state:
+        st.session_state["extracted_receipt_data"] = None
+
+    if uploaded_receipt is not None:
+        st.image(uploaded_receipt, caption="アップロードされたレシート", use_container_width=True) # use_container_widthに修正
+        
+        # 抽出処理 (初回処理または再抽出)
+        if st.button("レシートから食材を抽出する 🚀", key="extract_receipt_button"):
+            with st.spinner("AIがレシートを解析中です..."):
+                extracted_items = process_receipt(uploaded_receipt)
+
+            if extracted_items:
+                items_df = pd.DataFrame(extracted_items)
+                # 💡 修正点A: チェックボックス列の追加。初期値は全てTrue（登録対象）とする
+                items_df.insert(0, '登録対象', True) 
+                items_df['期限'] = (datetime.date.today() + datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+                items_df.rename(columns={'name': '食材名', 'quantity': '数量'}, inplace=True)
+                
+                st.session_state["extracted_receipt_data"] = items_df.to_dict('records')
+                display_auto_clear_message(f"✅ レシートから {len(extracted_items)} 個の品目を抽出しました。内容を確認してください。", "success")
+                st.rerun()
+
+            else:
+                display_auto_clear_message("レシートから品目を抽出できませんでした。画像が鮮明かご確認ください。", "warning")
+                st.session_state["extracted_receipt_data"] = None
+
+    # 💡 修正点2: 抽出データがセッションステートにあれば、編集エリアと登録ボタンを表示する
+    if st.session_state["extracted_receipt_data"] is not None:
+        
+        st.subheader("抽出された品目（登録内容の確認・編集）")
+        
+        current_df = pd.DataFrame(st.session_state["extracted_receipt_data"])
+        
+        # 💡 修正点B: 登録対象列をチェックボックスとして表示するように設定
+        edited_df = st.data_editor(
+            current_df,
+            column_config={
+                "登録対象": st.column_config.CheckboxColumn(
+                    "登録対象", # チェックボックスとして表示する列名
+                    default=True,
+                    help="チェックを外すと、この品目は登録されません。"
+                )
+            },
+            num_rows="dynamic",
+            hide_index=True,
+            key="edited_receipt_items" 
+        )
+
+        # 💡 修正点3: 最終登録ボタンのロジック
+        if st.button("確認した品目を冷蔵庫に一括登録する ✨", key="final_receipt_register"):
+            successful_count = 0
+            
+            # 💡 修正点C: 登録対象の行のみをフィルタリングする
+            items_to_register = edited_df[edited_df['登録対象'] == True]
+            
+            try:
+                with next(get_db()) as db:
+                    # 編集・フィルタリングされたデータフレームの各行を登録
+                    for index, row in items_to_register.iterrows():
+                        # 必須チェック
+                        if row['食材名'] and str(row['数量']).strip(): 
+                            use_by_date_obj = row['期限']
+                            
+                            # (省略: 日付オブジェクトの型変換ロジック - 変更なし)
+                            if isinstance(use_by_date_obj, pd.Timestamp):
+                                use_by_date_obj = use_by_date_obj.date()
+                            elif isinstance(use_by_date_obj, str):
+                                try:
+                                    use_by_date_obj = datetime.datetime.strptime(use_by_date_obj, "%Y-%m-%d").date()
+                                except ValueError:
+                                    use_by_date_obj = datetime.date.today() + datetime.timedelta(days=7)
+                            elif not isinstance(use_by_date_obj, datetime.date):
+                                use_by_date_obj = datetime.date.today() + datetime.timedelta(days=7)
+
+                            # 食材の追加
+                            add_ingredient(
+                                db=db,
+                                name=row['食材名'],
+                                quantity=row['数量'],
+                                use_by_date=use_by_date_obj,
+                                commit=False 
+                            )
+                            successful_count += 1
+                            
+                    # すべての登録が完了した後で一度だけコミット
+                    db.commit() 
+                    
+                display_auto_clear_message(f"🎉 {successful_count} 個の品目を冷蔵庫に登録しました！", "success")
+                
+                # UX改善: 登録成功後、セッションステートとアップロードをクリアして画面を初期状態に戻す
+                st.session_state["extracted_receipt_data"] = None 
+                
+                st.rerun()
+
+            except Exception as e:
+                # 登録失敗時、詳細なエラーメッセージを表示
+                display_auto_clear_message(f"品目の一括登録中にエラーが発生しました: {e}", "error")
+                                
+            else:
+                st.warning("レシートから品目を抽出できませんでした。画像が鮮明かご確認ください。")
+                
+    st.markdown("---") # 次のセクションと区切る
+    # ----------------------------------------------------
             
             
             
@@ -683,7 +864,7 @@ def main():
                         client = OpenAI(api_key=st.secrets["openai"]["api_key"]) 
                         
                         response = client.chat.completions.create(
-                            model="gpt-3.5-turbo",
+                            model="gpt-4o",
                             messages=[
                                 {"role": "system", "content": adjustment_system_prompt},
                                 {"role": "user", "content": adjustment_user_prompt}
